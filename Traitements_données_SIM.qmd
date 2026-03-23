@@ -1,0 +1,893 @@
+---
+title: "Traitements données SIM"
+format: html
+editor: visual
+---
+
+## Packages
+
+Installation package :
+
+```{r}
+#| echo: false
+#| warning: false
+# install.packages("pak")
+pak::pak("vincent-wawrzyniak/franceclimat")
+```
+
+Packages
+
+```{r}
+#| echo: false
+library(franceclimat)
+library(dplyr)
+library(duckdb)
+library(arrow)
+library(purrr)
+library(tidyr)
+library(sf)
+library(ggplot2)
+library(DBI)
+
+```
+
+## Intégration des données
+
+```{r}
+
+concatenation_sim2(
+  input_dir = "C:/workspace/sim/",
+  output_file = "C:/workspace/sim/ALL_sim2.parquet",
+  delim = ";",
+  format = "parquet"
+)
+
+
+```
+
+## Calculs
+
+Plus rapide avec duckdb qu'avec arrow
+
+### Années
+
+```{r}
+
+# Parquet
+data <- arrow::open_dataset("C:/workspace/sim/ALL_sim2.parquet")
+
+# Cas à calculer
+vars_funs <- list(
+  T = list(fun = "mean", nom = "T_moy"),
+  TINF_H = list(fun = "mean", nom = "Tmin_moy"),
+  TSUP_H = list(fun = "mean", nom = "Tmax_moy"),
+  PRENEI = list(fun = "sum", nom = "PRENEI_sum"),
+  PRELIQ = list(fun = "sum", nom = "PRELIQ_sum")
+)
+
+# Ajout des périodes
+data <- def_periode(data, date_col = "DATE", periode = "annee")
+
+# Appliquer calcul_periode_multi sur le dataset Arrow
+resultat_annee <- calcul_periode_multi(
+  data = data,
+  vars_funs = vars_funs,
+  year_filter = c(1959, 2025),
+  group_vars = c("LAMBX", "LAMBY", "annee", "periode")
+)
+
+```
+
+### Saisons
+
+```{r}
+  
+# Chemin vers le parquet dans le package
+file <- "C:/workspace/sim/ALL_sim2.parquet"
+  
+# Connexion DuckDB en mémoire
+con <- dbConnect(duckdb::duckdb())
+  
+# Création d'une table lazy directement depuis le parquet
+tbl_lazy <- tbl(con, sql(sprintf("SELECT * FROM read_parquet('%s')", file)))
+
+
+# Ajout des périodes
+data <- def_periode(tbl_lazy, date_col = "DATE", periode = "saison")
+
+# Ajout precip totales
+data <- data %>% 
+  mutate(precipitation = PRELIQ + PRENEI)
+
+# Cas à calculer
+vars_funs <- list(
+  T = list(fun = "mean", nom = "T_moy"),
+  precipitation = list(fun = "sum", nom = "precipitation")
+)
+
+# Appliquer calcul_periode_multi sur le dataset Arrow
+resultat_saison <- calcul_periode_multi(
+  data = data,
+  vars_funs = vars_funs,
+  year_filter = c(1959, 2025),
+  group_vars = c("LAMBX", "LAMBY", "annee", "periode")
+)
+```
+
+## Regressions linéraires
+
+```{r}
+
+# Appliquer la régression sur chaque tibble de la list
+res_lm_saison <- imap(resultat_saison, ~ { #imap : iteration sur une list
+  tibble_saison <- .x      # les tibbles de la list
+  noms <- .y            # les noms de la list : noms identiques au nomù de la col sur laquelle faire la reg
+  
+  regression_lineaire(
+    data = tibble_saison,
+    var = noms,
+    group_vars = c("LAMBX", "LAMBY", "periode")
+  )
+})
+
+res_lm_saison
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+# filtrer pour un point spécifique
+pt_sel <- result %>%
+  filter(LAMBX == 8920, LAMBY == 20250)  # change les coordonnées selon ton point
+
+# plot T_moy vs année
+ggplot(pt_sel, aes(x = annee, y = PRENEI_sum)) +
+  geom_line(color = "blue") +    # ligne
+  geom_point(color = "red") +    # points
+  theme_minimal() +
+  labs(
+    x = "Année",
+    y = "Température moyenne (°C)",
+    title = paste0("T_moy pour le point (", pt_sel$LAMBX[1], ", ", pt_sel$LAMBY[1], ")")
+  )
+```
+
+## Cartes
+
+### Données
+
+```{r}
+
+# lire les fichiers
+sim <- st_read("C:/workspace/sim_2154.gpkg")
+safran <- st_read("C:/workspace/safran.gpkg")
+# s'assurer que les CRS sont identiques -> transfo safran avec proj de sim (L93)
+safran <- st_transform(safran, st_crs(sim))
+
+gpkg_file <- "C:/workspace/admin_express.gpkg" # Lister toutes les couches : st_layers(gpkg_file)
+
+regions <- st_read(
+  dsn = gpkg_file,
+  layer = "region"
+)
+
+```
+
+### Comparaison normales
+
+#### Graphique
+
+```{r}
+graph_variabilite_saison <- function(
+  annee_etude = 2025,
+  titre = "Variabilité interannuelle de la température moyenne",
+  sous_titre = "Position d'une année dans la variabilité climatique",
+  legende_y_graphique = "Température moyenne (°C)",
+  variable = "T_moy",
+  type_graphique = c("groupe", "facet")
+) {
+  
+  type_graphique <- match.arg(type_graphique)
+  
+  # Variabilité annuelle moyenne France par saison
+  variabilite <- resultat_saison[[variable]] %>%
+    dplyr::group_by(annee, periode) %>%
+    dplyr::summarise(
+      valeur_france = mean(.data[[variable]], na.rm = TRUE),
+      .groups = "drop"
+    ) %>% 
+    mutate(periode = factor(periode,
+                            levels = c("Hiver", "Printemps", "Ete", "Automne")))
+  
+  # Normale climatique par saison
+  normales_graph <- variabilite %>%
+    dplyr::group_by(periode) %>%
+    dplyr::summarise(
+      normale = mean(valeur_france, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # Base graphique
+  graph <- ggplot2::ggplot(variabilite, aes(x = annee, y = valeur_france, color = periode)) +
+    
+    geom_line(linewidth = 1) +
+    geom_point(size = 1) +
+    
+    # normales climatiques avec légende
+    geom_hline(
+      data = normales_graph,
+      aes(yintercept = normale, linetype = "Normale climatique"),
+      color = "black",
+      show.legend = TRUE
+    ) +
+    
+    # année étudiée
+    geom_vline(
+      xintercept = annee_etude,
+      linetype = "dashed",
+      color = "black"
+    ) +
+    
+    geom_point(
+      data = variabilite %>% dplyr::filter(annee == annee_etude),
+      size = 3
+    ) +
+    
+    scale_color_manual(values = c(
+      "Hiver" = "#1f78b4",
+      "Printemps" = "#33a02c",
+      "Ete" = "#e31a1c",
+      "Automne" = "#ff7f00"
+    )) +
+    
+    scale_linetype_manual(
+      name = "", 
+      values = c("Normale climatique" = "dashed")
+    ) +
+    
+    theme_minimal() +
+    
+    labs(
+      title = titre,
+      subtitle = sous_titre,
+      x = "Année",
+      y = legende_y_graphique,
+      color = "Saison"
+    )
+  
+  # Option facettes : 4 graphiques séparés
+  if (type_graphique == "facet") {
+    graph <- graph +
+      facet_wrap(~periode, nrow = 2, ncol = 2) +
+      theme(strip.text = element_text(face = "bold"))
+  }
+  
+  return(graph)
+}
+```
+
+##### Température
+
+Au niveau national, les températures de 2025 se sont révélées **supérieures aux normales saisonnières**. L'été a été particulièrement chaud, avec une moyenne dépassant de plus de 2 °C la normale, ce qui en fait le **troisième été le plus chaud depuis 1959**. L'**hiver et le printemps ont également enregistré des températures remarquablement élevées**, tandis que l'automne n’a été que légèrement au-dessus de la normale. **L’année 2025 s’inscrit donc clairement dans la tendance à la hausse des températures observée depuis 1959**.
+
+```{r}
+graph_variabilite_saison(
+  annee_etude = 2025,
+  titre = "Evolution annuelle des températures moyennes saisonnières",
+  sous_titre = "Données Météo-France - SIM quotidienne",
+  legende_y_graphique = "Température moyenne (°C)",
+  variable = "T_moy",
+  type_graphique = "groupe"
+)
+```
+
+##### Précipitation
+
+Au niveau national, **la tendance globale des précipitations reste moins nette que celle des températures et leur variabilité interannuelle demeure élevée**. En 2025, l’**été et l’hiver se sont montrés proches des normales saisonnières**. L’**automne a enregistré des précipitations légèrement supérieures à la moyenne**, tandis que le **printemps a connu un léger déficit** par rapport aux valeurs habituelles.
+
+```{r}
+graph_variabilite_saison(
+  annee_etude = 2025,
+  titre = "Evolution annuelle des cumuls de précipitation saisonniers",
+  sous_titre = "Données Météo-France - SIM quotidienne",
+  legende_y_graphique = "Précipitation (mm)",
+  variable = "precipitation",
+  type_graphique = "facet"
+)
+```
+
+Carte
+
+```{r}
+
+carte_comparaison_normales = function(annee_etude = 2025,
+                                      titre = "Anomalie de température par rapport à la normale",
+                                      sous_titre = "Année 2025",
+                                      caption = "Carte réalisée par Vincent Wawrzyniak",
+                                      titre_legende = "Anomalie (°C)",
+                                      variable = "T_moy",
+                                      couleurs = c(
+                                        "#2166ac",  # bleu fort
+                                        "#4393c3",  # bleu
+                                        "#92c5de",  # bleu clair
+                                        "#f7f7f7",  # blanc (0)
+                                        "#fdd870",  # jaune
+                                        "#f46d43",  # orange
+                                        "#d73027"   # rouge
+                                        )) {
+  
+  normales = resultat_saison[[variable]] %>%
+    group_by(LAMBX, LAMBY, periode) %>%
+    summarise(normale = mean(.data[[variable]], na.rm = TRUE), .groups = "drop")
+  
+  data_annee = resultat_saison[[variable]] %>%
+    filter(annee == annee_etude)
+  
+  data = left_join(data_annee, normales, by = join_by(LAMBX, LAMBY, periode))
+  
+  data_anom <- data %>%
+    mutate(anomalie = .data[[variable]] - normale,
+           periode = factor(periode, levels = c("Hiver", "Printemps", "Ete", "Automne")))
+  
+  sim_map <- sim %>%
+    left_join(data_anom, by = c("lambx" = "LAMBX", "lamby" = "LAMBY"))
+  
+  safran_map <- st_join(safran, sim_map)
+  
+  limite <- max(abs(safran_map$anomalie), na.rm = TRUE)
+  limits = c(-limite, limite)
+  
+  range(safran_map$anomalie, na.rm = TRUE)
+  
+  carte = ggplot(safran_map) +
+    geom_sf(aes(fill = anomalie), color = NA) +
+    geom_sf(
+      data = regions,
+      fill = NA,
+      color = "black",
+      size = 0.3
+    ) +
+    scale_fill_gradientn(
+      colours = couleurs,
+      limits = limits,
+      oob = scales::squish,
+      name = titre_legende
+    ) +
+    facet_wrap( ~ periode, nrow = 2, ncol = 2) +
+    theme_void() +
+    labs(title = titre,
+         subtitle = sous_titre,
+         caption = caption) +
+    theme(
+      strip.text = element_text(face = "bold"),
+      plot.caption = element_text(
+        size = 7,
+        color = "grey30",
+        hjust = 0
+      )
+    )
+  
+  return(carte)
+  
+}
+
+
+
+```
+
+Températre
+
+Les **tendances des températures en 2025 sont globalement assez homogènes sur l’ensemble du territoire**. On observe toutefois des **anomalies positives en hiver dans les Alpes, le Massif central et le Sud-Ouest**. **L’été, les anomalies de températures ont été plus élevées dans le Sud** que dans le Nord, soulignant un gradient méridional des anomalies estivales.
+
+```{r}
+carte_comparaison_normales(
+  annee_etude = 2025,
+  titre = "Anomalie de température en 2025 par rapport à la normale 1959-2025",
+  sous_titre = "Données Météo-France - SIM quotidienne",
+  caption = "Carte réalisée par Vincent Wawrzyniak",
+  titre_legende = "Anomalie (°C)",
+  variable = "T_moy"
+)
+
+```
+
+Précipitation
+
+Les **précipitations présentent en 2025 des contrastes plus marqués selon les régions**. L’été et l’hiver ont été globalement proches des normales saisonnières, avec de **faibles écarts selon les territoires**, à l’exception d’un **léger excédent hivernal dans le Nord-Ouest** de la France. Au **printemps**, le **déficit de précipitations a concerné surtout la moitié nord** du pays, tandis que le **Sud-Est a connu des précipitations supérieures** à la normale. En **automne, le pourtour méditerranéen a enregistré un déficit marqué**, alors que la majorité du territoire a présenté un excédent par rapport aux normales.
+
+```{r}
+
+
+
+carte_comparaison_normales(
+  annee_etude = 2025,
+  titre = "Anomalie de précipitation en 2025 par rapport à la normale 1959-2025",
+  sous_titre = "Données Météo-France - SIM quotidienne",
+  caption = "Carte réalisée par Vincent Wawrzyniak",
+  titre_legende = "Anomalie (mm)",
+  variable = "precipitation",
+  couleurs = c(
+    "#d73027",
+    # rouge
+    "#f46d43",
+    # orange
+    "#fdd870",
+    # jaune
+    "#f7f7f7",
+    # blanc (0)
+    "#92c5de",
+    # bleu clair
+    "#4393c3",
+    # bleu
+    "#2166ac"  # bleu fort
+  )
+)
+```
+
+### Evolution
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(sf)
+library(purrr)
+
+# --- Combiner les 4 saisons en un seul tibble avec variable pour faceting ---
+tmoy = res_lm_saison$T_moy
+
+# --- Joindre avec la grille safran ---
+
+# joindre les résultats aux points SIM
+sim_map <- sim %>%
+  left_join(tmoy, by = c("lambx" = "LAMBX", "lamby" = "LAMBY"))
+
+# --- Joindre avec la grille safran ---
+safran_map <- st_join(safran, sim_map)
+
+
+# projeter les pentes sur la grille safran
+safran_map <- safran_map %>%
+  mutate(
+    fill_val = ifelse(p_value > 0.05, NA, 10*slope),  # gris si non significatif / x10 par décénie
+    periode = factor(periode,
+                     levels = c("Hiver", "Printemps", "Ete", "Automne"))
+  )
+
+limites_min <- min(safran_map$fill_val, na.rm = TRUE)
+limites_max <- max(safran_map$fill_val, na.rm = TRUE)
+
+# --- Palette
+palette_vals <- c(
+  "#4575b4",  # bleu foncé négatif
+  "#ffffbf",  # blanc / neutre
+  "#fdae61",  # orange
+  "#d73027"   # rouge foncé
+)
+
+ggplot(safran_map) +
+  geom_sf(aes(fill = fill_val), color = NA) +
+  geom_sf(data = regions, fill = NA, color = "black", size = 0.3) +
+  scale_fill_gradientn(
+    colours = palette_vals,
+    na.value = "grey70",
+    limits = c(limites_min, 0.6),  # ajuste selon ton échelle des pentes
+    oob = scales::squish # valeurs hors limites
+  ) +
+  facet_wrap(~periode, nrow = 2, ncol = 2) +
+  theme_void() +
+  labs(
+    fill = "Pente (°C/décénie)\n(NA = non significatif)",
+    title = "Évolution de la température moyenne par saison 1959-2025",
+    subtitle = "Données Météo-France - SIM quotidienne",
+    caption = "Carte réalisée par Vincent Wawrzyniak"
+  ) +
+  theme(
+    plot.caption = element_text(size = 7, color = "grey30", hjust = 0),
+    strip.text = element_text(face = "bold")
+  )
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(sf)
+library(purrr)
+
+# --- Combiner les 4 saisons en un seul tibble avec variable pour faceting ---
+PRELIQ_sum = res_lm_saison$PRELIQ_sum
+
+# --- Joindre avec la grille safran ---
+
+# joindre les résultats aux points SIM
+sim_map <- sim %>%
+  left_join(PRELIQ_sum, by = c("lambx" = "LAMBX", "lamby" = "LAMBY"))
+
+# --- Joindre avec la grille safran ---
+safran_map <- st_join(safran, sim_map)
+
+# projeter les pentes sur la grille safran
+safran_map <- safran_map %>%
+  mutate(
+    fill_val = ifelse(p_value > 0.05, NA, 10* slope),  # gris si non significatif / x10 par décénie
+    periode = factor(periode,
+                     levels = c("Hiver", "Printemps", "Ete", "Automne"))
+  )
+
+limites_min <- min(safran_map$fill_val, na.rm = TRUE)
+limites_max <- max(safran_map$fill_val, na.rm = TRUE)
+
+# --- Palette
+palette_vals <- c(
+  "#4575b4",  # bleu foncé négatif
+  "#ffffbf",  # blanc / neutre
+  "#fdae61",  # orange
+  "#d73027"   # rouge foncé
+)
+
+ggplot(safran_map) +
+  geom_sf(aes(fill = fill_val), color = NA) +
+  geom_sf(data = regions, fill = NA, color = "black", size = 0.3) +
+  scale_fill_gradientn(
+    colours = palette_vals,
+    na.value = "grey70",
+    limits = c(limites_min, limites_max),  # ajuste selon ton échelle des pentes
+    oob = scales::squish # valeurs hors limites
+  ) +
+  facet_wrap(~periode, nrow = 2, ncol = 2) +
+  theme_void() +
+  labs(
+    fill = "Pente (mm/décénie)\n(NA = non significatif)",
+    title = "Évolution des cumuls de précipitations par saison 1959-2025",
+    subtitle = "Données Météo-France - SIM quotidienne",
+    caption = "Carte réalisée par Vincent Wawrzyniak"
+  ) +
+  theme(
+    plot.caption = element_text(size = 7, color = "grey30", hjust = 0),
+    strip.text = element_text(face = "bold")
+  )
+```
+
+### Statique
+
+#### Tmoy
+
+```{r}
+
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(purrr)
+
+# --- Années à visualiser ---
+annees_sel <- c(1960, 1990, 2025)
+
+# Préparer les données pour toutes les années sélectionnées
+data_combined <- map_dfr(annees_sel, function(yr) {
+  data_sim_annee <- sim %>% 
+    left_join(resultat_annee$T_moy, by = c("lambx" = "LAMBX", "lamby" = "LAMBY")) %>%
+    filter(annee == yr)
+  
+  safran_map_yr <- st_join(safran, data_sim_annee) %>%
+    mutate(
+      annee = yr
+    )
+  
+  safran_map_yr
+})
+
+# --- Carte avec gradient continu ---
+ggplot(data_combined) +
+  geom_sf(aes(fill = T_moy), color = NA) +
+  geom_sf(data = regions, fill = NA, color = "black", size = 0.5) +
+scale_fill_gradientn(
+  colours = c(
+    "#2b83ba",
+    "#80bfdb",
+    "#ffffbf",
+    "#fdae61",
+    "#d7191c"
+  ),
+  limits = range(data_combined$T_moy, na.rm = TRUE),
+  name = "T(°C)"
+) +
+  facet_wrap(~annee, nrow = 1) +
+  theme_minimal() +
+  labs(
+    title = "Température moyenne annuelle",
+    subtitle = "Données Météo-France - SIM quotidienne"
+  )
+
+
+```
+
+#### Tmax
+
+```{r}
+
+
+# --- Années à visualiser ---
+annees_sel <- c(1960, 1990, 2025)
+
+# Préparer les données pour toutes les années sélectionnées
+data_combined <- map_dfr(annees_sel, function(yr) {
+  data_sim_annee <- sim %>% 
+    left_join(resultat_annee$Tmax_moy, by = c("lambx" = "LAMBX", "lamby" = "LAMBY")) %>%
+    filter(annee == yr)
+  
+  safran_map_yr <- st_join(safran, data_sim_annee) %>%
+    mutate(
+      annee = yr
+    )
+  
+  safran_map_yr
+})
+
+# --- Carte avec gradient continu ---
+ggplot(data_combined) +
+  geom_sf(aes(fill = Tmax_moy), color = NA) +
+  geom_sf(data = regions, fill = NA, color = "black", size = 0.5) +
+scale_fill_gradientn(
+  colours = c(
+    "#2b83ba",
+    "#80bfdb",
+    "#ffffbf",
+    "#fdae61",
+    "#d7191c"
+  ),
+  limits = range(data_combined$Tmax_moy, na.rm = TRUE),
+  name = "Tmax (°C)"
+) +
+  facet_wrap(~annee, nrow = 1) +
+  theme_minimal() +
+  labs(
+    title = "Température maximale moyenne annuelle",
+    subtitle = "Données Météo-France - SIM quotidienne"
+  )
+```
+
+```{r}
+
+annee_sel = 2025
+
+data_sim = sim %>% left_join(resultat_annee$T_moy, by = c("lambx" = "LAMBX", "lamby" = "LAMBY"))
+
+
+# filtrer sur l'année
+data_sim_annee <- data_sim %>% filter(annee == annee_sel)
+
+# joindre les valeurs des points à la grille
+safran_map <- st_join(safran, data_sim_annee)
+
+# créer la variable pour la couleur
+# ici on n'applique pas de filtre p_value puisque c'est pour l'année brute
+safran_map <- safran_map %>%
+  mutate(fill_val = T_moy)  # ou PRELIQ_sum selon la variable que tu veux
+
+# --- Carte statique ---
+# Créer des classes pour les plages de T_moy
+safran_map <- safran_map %>%
+  mutate(
+    fill_class = cut(
+      T_moy,
+      breaks = c(-Inf, 9, 10, 11, 12, 13, Inf),
+      labels = c("≤9","9-10","10-11","11-12","12-13",">13"),
+      include.lowest = TRUE
+    )
+  )
+
+# Palette personnalisée correspondant aux plages
+palette_vals <- c(
+  "≤9"    = "#076fb2",  # bleu foncé
+  "9-10"  = "#73b4d7",  # bleu
+  "10-11" = "#cfe3ec",  # bleu clair
+  "11-12" = "#f8d8cb",  # orange clair
+  "12-13" = "#ee846c",  # orange
+  ">13"   = "#c8011e"   # rouge
+)
+
+# Carte statique
+ggplot(safran_map) +
+  geom_sf(aes(fill = fill_class), color = NA) +
+  geom_sf(data = regions, fill = NA, color = "black", size = 0.5) +
+  scale_fill_manual(
+    values = palette_vals,
+    drop = FALSE  # garde toutes les classes même si pas présentes
+  ) +
+  theme_minimal() +
+  labs(
+    fill = paste0("T_moy (°C) en ", annee_sel),
+    title = paste("Carte des températures pour l'année", annee_sel)
+  )
+
+```
+
+### Evolutions
+
+carte2
+
+```{r}
+
+
+res_lm = res_lm_list_ete$T_moy
+
+res_lm = res_lm_list_hiver$T_moy
+#res_lm = res_lm_list$T_moy
+res_lm = res_lm_list$PRELIQ_sum
+
+#res_lm = res_lm_list_printemps$T_moy
+
+
+sim2 = sim %>% left_join(res_lm, by = c("lambx" = "LAMBX", "lamby" = "LAMBY"))
+
+
+safran_map <- st_join(safran, sim2)
+
+# créer une variable de couleur conditionnelle
+safran_map <- safran_map %>%
+  mutate(fill_val = ifelse(p_value > 0.05, NA, slope))  # NA → sera grisé
+
+# carte
+ggplot(safran_map) +
+  geom_sf(aes(fill = 10*fill_val), color = NA) +          # pas de contours
+  scale_fill_gradientn(
+  colours = c(
+    "darkblue",  # blanc
+    "lightblue",  # jaune clair
+    "#fecc5c",  # orange clair
+    "#fd8d3c",  # orange
+    "#e31a1c"   # rouge foncé
+  ),
+  na.value = "grey70",
+  limits = c(0, 0.6),
+  oob = scales::squish
+)+
+  geom_sf(data = regions, fill = NA, color = "black", size = 0.5) +
+  theme_minimal() +
+  labs(
+    fill = "T°C/décénie\n(gris = non significatif)",  # <-- texte explicatif
+    title = "Évolution de la température moyenne annuelle 1959-2025",
+    subtitle = "Données Météo-France - SIM quotidienne",
+    caption = "Carte réalisée par Vincent Wawrzyniak"
+  ) +
+  theme(
+    plot.caption = element_text(size = 7, color = "grey30", hjust = 0)  # petite taille
+  )
+
+```
+
+### Ete moins hiver
+
+```{r}
+
+ete_moins_hiver = res_lm_list_ete$T_moy %>%
+  rename(slope_ete = slope,
+         p_value_ete = p_value) %>%
+  left_join(res_lm_list_hiver$T_moy  %>%
+  rename(slope_hiver = slope,
+         p_value_hiver = p_value)) %>%
+  mutate(
+  slope_ete = case_when(
+    p_value_ete >= 0.05 ~ 0,
+    TRUE ~ slope_ete
+  )
+) %>%
+  mutate(
+  slope_hiver = case_when(
+    p_value_hiver >= 0.05 ~ 0,
+    TRUE ~ slope_hiver
+  )
+) %>%
+  mutate(ete_moins_hiver = slope_ete - slope_hiver)
+
+# joindre les résultats à la grille
+sim_diff <- sim %>%
+  left_join(ete_moins_hiver, by = c("lambx" = "LAMBX", "lamby" = "LAMBY"))
+
+# projeter sur la grille safran
+safran_map <- st_join(safran, sim_diff)
+
+# carte
+ggplot(safran_map) +
+  geom_sf(aes(fill = ete_moins_hiver), color = NA) +
+  scale_fill_gradient2(
+    low = "#2166ac",   # bleu
+    mid = "white",
+    high = "#b2182b",  # rouge
+    midpoint = 0,
+    na.value = "grey70"
+  ) +
+  geom_sf(data = regions, fill = NA, color = "black", size = 0.5) +
+  theme_minimal() +
+  labs(
+    fill = "ΔT (°C/décennie)",
+    title = "Différence de réchauffement : Été − Hiver",
+    subtitle = "Valeurs positives : réchauffement plus fort en été",
+    caption = "Carte réalisée par Vincent Wawrzyniak"
+  ) +
+  theme(
+    plot.caption = element_text(size = 7, color = "grey30", hjust = 0)
+  )
+```
+
+### Saison la plus marquée
+
+```{r}
+library(dplyr)
+
+saisons <- list(
+  hiver = res_lm_list_hiver$T_moy,
+  printemps = res_lm_list_printemps$T_moy,
+  ete = res_lm_list_ete$T_moy,
+  automne = res_lm_list_automne$T_moy
+)
+
+df_saisons <- bind_rows(saisons, .id = "saison")
+
+saison_max <- df_saisons %>%
+  group_by(LAMBX, LAMBY) %>%
+  slice_max(order_by = slope, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+sim_saison <- sim %>%
+  left_join(saison_max, by = c("lambx" = "LAMBX", "lamby" = "LAMBY"))
+
+safran_map <- st_join(safran, sim_saison)
+
+ggplot(safran_map) +
+  geom_sf(aes(fill = saison), color = NA) +
+  geom_sf(data = regions, fill = NA, color = "black", size = 0.5) +
+  scale_fill_manual(
+    values = c(
+      hiver = "#1f78b4",
+      printemps = "#33a02c",
+      ete = "#ff7f00",
+      automne = "#6a3d9a"
+    )
+  ) +
+  theme_minimal() +
+  labs(
+    fill = "Saison dominante",
+    title = "Saison du réchauffement maximal",
+    subtitle = "Tendance de température 1959-2025",
+    caption = "Carte réalisée par Vincent Wawrzyniak"
+  )
+```
+
+### Amplitude saisonniere
+
+```{r}
+
+amplitude_saison <- df_saisons %>%
+  group_by(LAMBX, LAMBY) %>%
+  summarise(
+    slope_max = max(slope, na.rm = TRUE),
+    slope_min = min(slope, na.rm = TRUE),
+    amplitude = slope_max - slope_min,
+    .groups = "drop"
+  )
+
+sim_amp <- sim %>%
+  left_join(amplitude_saison, by = c("lambx" = "LAMBX", "lamby" = "LAMBY"))
+
+safran_map <- st_join(safran, sim_amp)
+
+ggplot(safran_map) +
+  geom_sf(aes(fill = 10 * amplitude), color = NA) +
+  geom_sf(data = regions, fill = NA, color = "black", size = 0.5) +
+  scale_fill_gradientn(
+    colours = c(
+      "#ffffcc",
+      "#fed976",
+      "#fd8d3c",
+      "#e31a1c"
+    ),
+    name = "Amplitude\n°C/décennie"
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Amplitude saisonnière du réchauffement",
+    subtitle = "Différence entre la saison qui se réchauffe le plus et le moins",
+    caption = "Carte réalisée par Vincent Wawrzyniak"
+  )
+```
